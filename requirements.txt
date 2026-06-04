@@ -1,0 +1,6 @@
+flask>=2.3.0
+anthropic>=0.25.0
+# Optional for production extensions:
+# networkx>=3.2          # Schema memory graph operations
+# numpy>=1.24.0          # Regression curve computation
+# scipy>=1.11.0          # Statistical schema analysis
