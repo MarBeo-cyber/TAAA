@@ -1,3 +1,5 @@
+[![AURA Framework](https://img.shields.io/badge/AURA-Level%206%20%7C%20TAAA-1F3864)](https://github.com/MarBeo-cyber/AURA)
+
 # 🌐 TAAA — Translational Autopoietic Adaptive Agent
 
 > **Schema memory and inter-schema translation for human-machine cognitive systems.**
