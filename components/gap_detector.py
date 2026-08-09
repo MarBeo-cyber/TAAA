@@ -15,18 +15,31 @@ The American in Shinjuku doesn't think "I don't know where to go."
 He thinks "I know where to go." That is the interference condition.
 It is more dangerous than ignorance because the person acts with confidence.
 
-Uses LLM for nuanced schema analysis.
-Falls back to rule-based detection when LLM unavailable.
+Two detectors, and they are not equivalent:
+
+  _detect_gap_llm    — asks a model to reason about the scenario. Reports the
+                       model's own `confidence` number.
+
+  _detect_gap_rules  — the no-API-key fallback. It is a KEYWORD CLASSIFIER over
+                       the scenario text plus the caller-supplied `current_action`
+                       label, cross-checked against M1's interference risk between
+                       the subject's culture and the environment's. It has no
+                       calibration data, so it reports `confidence=None` and a
+                       discrete `rule_id` naming the rule that fired, plus the
+                       matched substrings in `evidence`. Do not read a rule_id as
+                       a measurement: it tells you which words were present, not
+                       how likely the classification is to be right.
 """
 
 from __future__ import annotations
 
 import json
-import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+
+from schema_memory.m1_priors import M1
 
 logger = logging.getLogger("taaa.gap_detector")
 
@@ -50,13 +63,21 @@ class GapType(Enum):
 class GapAnalysis:
     """Result of gap detection analysis."""
     gap_type: GapType
-    confidence: float                  # 0.0 – 1.0
     active_schema: Optional[str]       # The schema the person is using
     expected_schema: Optional[str]     # The schema the environment requires
     predicted_wrong_action: Optional[str]
     suppression_required: bool         # True for INTERFERENCE
     rationale: str
-    m_level_recommended: str          # M0 / M1 / M2
+    m_level_recommended: str           # M0 / M1 / M2
+
+    detector: str = "rules"            # "llm" | "rules"
+    # Self-reported by the LLM. None on the rules path — the keyword classifier
+    # has no calibration set, so any number it printed would be decoration.
+    confidence: Optional[float] = None
+    # Which rule fired, on the rules path. None on the LLM path.
+    rule_id: Optional[str] = None
+    # The substrings/among-signals that actually made the rule fire.
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -145,78 +166,187 @@ Analyse for schema gaps. Focus especially on whether the person has an ACTIVE bu
 
         return GapAnalysis(
             gap_type=GapType(data.get("gap_type", "none")),
-            confidence=float(data.get("confidence", 0.5)),
             active_schema=data.get("active_schema"),
             expected_schema=data.get("expected_schema"),
             predicted_wrong_action=data.get("predicted_wrong_action"),
             suppression_required=bool(data.get("suppression_required", False)),
             rationale=data.get("rationale", ""),
             m_level_recommended=data.get("m_level_recommended", "M1"),
+            detector="llm",
+            # Model self-report, not a measured calibration.
+            confidence=float(data.get("confidence", 0.5)),
         )
     except Exception as e:
         logger.warning("[GapDetector] LLM failed: %s — using rules", e)
         return _detect_gap_rules(scenario, subject_profile, current_action, domain)
 
 
+# ── Rule-based fallback: keyword lists ───────────────────────────────────────
+# These are hand-written substring lists, not learned features. They are the
+# no-API-key floor of the system, and the code says so everywhere it reports.
+
+# Automaticity: the person acts without checking. This is the behavioural
+# signature of an ACTIVE schema — the "he believes he knows" half of interference.
+AUTOMATICITY_MARKERS = [
+    "turns toward", "walks toward", "walking confidently", "assumes",
+    "expects", "believes", "confident", "certain", "automatically",
+    "immediately", "without checking", "as usual", "obviously",
+]
+
+# Uncertainty: the person knows they don't know. Signature of IGNORANCE.
+UNCERTAINTY_MARKERS = [
+    "confused", "lost", "doesn't know", "does not know", "asks",
+    "looks around", "hesitates", "uncertain", "stops and looks",
+    "cannot answer", "can't answer", "unsure", "not sure",
+    "doesn't have access", "does not have access",
+]
+
+# Mismatch: the SITUATION states that the two schemas diverge. Required for
+# INTERFERENCE, because interference is a claim about the world, not about how
+# the caller happened to phrase the action label. Deliberately phrase-level:
+# a bare "wrong" would fire on "Nothing is wrong."
+MISMATCH_MARKERS = [
+    "wrong direction", "wrong exit", "wrong way", "wrong turn",
+    "opposite to", "opposite direction", "but in this", "but in japanese",
+    "incompatible", "does not mean", "doesn't mean", "means something different",
+    "misinterpret", "actually means", "instead of", "two incompatible",
+    "in us business culture", "perceived as", "the gap is ontological",
+]
+
+# M1 interference risk at or above this counts as a schema conflict between the
+# subject's culture and the environment's. M1.interference_risk is a real count
+# over 6 declared dimensions (see m1_priors.py), so this is the one input here
+# that is computed rather than matched.
+SCHEMA_CONFLICT_RISK_THRESHOLD = 0.50
+
+
+def _matches(text: str, markers: list[str]) -> list[str]:
+    return [m for m in markers if m in text]
+
+
+def _schema_conflict(subject_profile: dict) -> tuple[Optional[bool], list[str]]:
+    """Is the subject's cultural schema in conflict with the environment's?
+
+    Returns (True | False | None, evidence). None means "not determinable" —
+    one of the two profiles is unknown to M1, so the caller must not treat the
+    absence of a conflict as evidence of agreement.
+
+    This replaces the old `any(ctx in env_context for ctx in high_risk_contexts)`,
+    which compared M1 phrases like "high_context_communication" against culture
+    ids like "east_asian" and was therefore never true.
+    """
+    env_context = (subject_profile.get("environment_context") or "").strip()
+    culture = subject_profile.get("culture")
+
+    # Path 1 — both sides are known M1 communities: compute the real risk.
+    if culture and env_context and M1.get(culture) and M1.get(env_context):
+        risk = M1.interference_risk(culture, env_context)
+        if risk["score"] >= SCHEMA_CONFLICT_RISK_THRESHOLD:
+            return True, [f"m1_interference_risk={risk['score']} "
+                          f"({len(risk['conflict_dimensions'])} dimensions)"]
+        return False, [f"m1_interference_risk={risk['score']}"]
+
+    # Path 2 — the caller passed a context *label* rather than a community id
+    # (e.g. environment_context="high_context_communication"). Match it against
+    # this subject's declared high-interference contexts.
+    high_risk_contexts = (subject_profile.get("m1_prior") or {}).get(
+        "high_interference_contexts", [])
+    hits = [ctx for ctx in high_risk_contexts if ctx and ctx in env_context]
+    if hits:
+        return True, [f"declared_high_interference_context:{h}" for h in hits]
+
+    return None, []
+
+
 def _detect_gap_rules(scenario: str, subject_profile: dict,
                       current_action: Optional[str], domain: str) -> GapAnalysis:
-    """Rule-based fallback gap detection."""
-    s = scenario.lower()
-    profile = subject_profile
+    """Keyword classifier over scenario + action label. NOT a measurement.
 
-    # Interference signals: confidence markers in action
-    interference_keywords = [
-        "turns toward", "walks toward", "assumes", "expects",
-        "believes", "confident", "certain", "automatically"
-    ]
-    ignorance_keywords = [
-        "confused", "lost", "doesn't know", "asks", "looks around",
-        "hesitates", "uncertain", "stops and looks"
-    ]
+    Inputs actually consumed:
+      - scenario text          (was computed and discarded before this fix)
+      - current_action label   (caller-supplied)
+      - M1 interference risk between subject culture and environment context
 
+    Output carries `rule_id` and `evidence` instead of a confidence float.
+    """
+    scenario_text = (scenario or "").lower()
     action_text = (current_action or "").lower()
-    has_interference_signal = any(kw in action_text for kw in interference_keywords)
-    has_ignorance_signal = any(kw in action_text for kw in ignorance_keywords)
+    both = f"{scenario_text} || {action_text}"
 
-    # Check high-interference contexts from M1
-    m1_prior = profile.get("m1_prior", {})
-    high_risk_contexts = m1_prior.get("high_interference_contexts", [])
-    env_context = profile.get("environment_context", "")
-    schema_conflict = any(ctx in env_context for ctx in high_risk_contexts)
+    automaticity = _matches(both, AUTOMATICITY_MARKERS)
+    uncertainty = _matches(both, UNCERTAINTY_MARKERS)
+    mismatch = _matches(scenario_text, MISMATCH_MARKERS)
+    conflict, conflict_evidence = _schema_conflict(subject_profile)
 
-    if has_interference_signal or schema_conflict:
+    culture = subject_profile.get("culture") or "unknown"
+    env_context = subject_profile.get("environment_context") or "current environment"
+
+    # R1 — INTERFERENCE. Requires all three: the person acts automatically, the
+    # situation states that the schemas diverge, and M1 does not positively rule
+    # out a cultural conflict. Automaticity alone is not enough — that was the
+    # bug that classified "walks toward the counter" at a coffee kiosk as an
+    # emergency haptic stop.
+    if automaticity and mismatch and conflict is not False:
         return GapAnalysis(
             gap_type=GapType.INTERFERENCE,
-            confidence=0.72,
-            active_schema=f"Habitual schema from {profile.get('culture', 'unknown')} context",
-            expected_schema=f"Schema required by {env_context or 'current environment'}",
+            active_schema=f"Habitual schema from {culture} context",
+            expected_schema=f"Schema required by {env_context}",
             predicted_wrong_action=current_action,
             suppression_required=True,
-            rationale="Interference detected: active schema from different cultural context.",
+            rationale=("Interference: automatic action plus a stated schema "
+                       "divergence in the situation."),
             m_level_recommended="M0" if domain == "emergency" else "M1",
+            detector="rules",
+            rule_id="interference_automaticity_and_stated_mismatch",
+            evidence=automaticity + mismatch + conflict_evidence,
         )
-    elif has_ignorance_signal:
+
+    # R2 — PARTIAL. Both signatures present: the person is confident about part
+    # of the situation and openly lost about another part. The schema is
+    # partially right and needs refinement rather than suppression.
+    if automaticity and uncertainty:
+        return GapAnalysis(
+            gap_type=GapType.PARTIAL,
+            active_schema=f"Partially applicable schema from {culture} context",
+            expected_schema=f"Schema required by {env_context}",
+            predicted_wrong_action=None,
+            suppression_required=False,
+            rationale=("Partial: confident and uncertain signals coexist — "
+                       "schema applies in part, needs refinement."),
+            m_level_recommended="M1" if domain == "emergency" else "M2",
+            detector="rules",
+            rule_id="partial_mixed_signals",
+            evidence=automaticity + uncertainty,
+        )
+
+    # R3 — IGNORANCE. The person is seeking, not asserting.
+    if uncertainty:
         return GapAnalysis(
             gap_type=GapType.IGNORANCE,
-            confidence=0.68,
             active_schema=None,
-            expected_schema=None,
+            expected_schema=f"Schema required by {env_context}",
             predicted_wrong_action=None,
             suppression_required=False,
-            rationale="Ignorance detected: person is seeking information.",
+            rationale="Ignorance: person is seeking information.",
             m_level_recommended="M1",
+            detector="rules",
+            rule_id="ignorance_uncertainty_markers",
+            evidence=uncertainty,
         )
-    else:
-        return GapAnalysis(
-            gap_type=GapType.NONE,
-            confidence=0.55,
-            active_schema=None,
-            expected_schema=None,
-            predicted_wrong_action=None,
-            suppression_required=False,
-            rationale="No clear gap signal detected.",
-            m_level_recommended="M2",
-        )
+
+    # R4 — NONE.
+    return GapAnalysis(
+        gap_type=GapType.NONE,
+        active_schema=None,
+        expected_schema=None,
+        predicted_wrong_action=None,
+        suppression_required=False,
+        rationale="No keyword signal for a schema gap in scenario or action.",
+        m_level_recommended="M2",
+        detector="rules",
+        rule_id="none_no_signal",
+        evidence=conflict_evidence,
+    )
 
 
 # ── Interference Predictor ────────────────────────────────────────────────────

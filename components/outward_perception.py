@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import time
 import logging
-import random
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -122,20 +121,30 @@ class OutwardPerceptionLayer:
     any analysis. Returns empty/denied result if consent absent.
     """
 
+    # Simulation phases, in the order the scripted cycle walks through them.
+    SIM_PHASES = ("processing", "response_ready", "listening")
+
     def __init__(self, simulation_mode: bool = True):
         self.simulation_mode = simulation_mode
         self._silence_start: Optional[float] = None
         self._last_state = InterlocutorState.UNKNOWN
+        self._sim_cycle = 0
 
     def observe(self, observer_subject_id: str,
                 interlocutor_profile: Optional[dict] = None,
-                scenario_context: str = "") -> OutwardPerceptionResult:
+                scenario_context: str = "",
+                sim_phase: Optional[str] = None) -> OutwardPerceptionResult:
         """
         One observation cycle of the interlocutor.
 
         observer_subject_id: the WEARING party (e.g., David)
         interlocutor_profile: cultural/personal profile of the other party
         scenario_context: current conversation context
+        sim_phase: simulation only — force one of SIM_PHASES instead of
+                   advancing the internal cycle. Exists because the simulator
+                   used to pick a phase from the wall clock (`time.time() % 10`),
+                   which made every demo run non-reproducible and let scripts
+                   narrate readings they had not taken.
         """
         ts = time.time()
 
@@ -152,7 +161,8 @@ class OutwardPerceptionLayer:
 
         # ── Observation ───────────────────────────────────────────────────────
         if self.simulation_mode:
-            signals = self._simulate_signals(interlocutor_profile, scenario_context)
+            signals = self._simulate_signals(interlocutor_profile,
+                                             scenario_context, sim_phase)
         else:
             signals = self._observe_realtime()
 
@@ -176,27 +186,31 @@ class OutwardPerceptionLayer:
         )
 
     def _simulate_signals(self, profile: Optional[dict],
-                          context: str) -> NonVerbalSignals:
+                          context: str,
+                          phase: Optional[str] = None) -> NonVerbalSignals:
         """
-        Simulate realistic non-verbal signals.
-        East Asian business context: high probability of active processing silence.
+        Scripted non-verbal signals. THIS IS NOT A MEASUREMENT — it replays one
+        of three hand-written signal sets. It is deterministic: the phase comes
+        from the caller or from an internal counter, never from the wall clock.
         """
         ts = time.time()
-        culture = (profile or {}).get("culture", "unknown")
 
-        # Simulate different phases of the negotiation silence
-        elapsed = ts % 10   # Cycle through phases for demo purposes
+        if phase is None:
+            phase = self.SIM_PHASES[self._sim_cycle % len(self.SIM_PHASES)]
+            self._sim_cycle += 1
+        if phase not in self.SIM_PHASES:
+            raise ValueError(f"unknown sim_phase {phase!r}; "
+                             f"expected one of {self.SIM_PHASES}")
 
-        if elapsed < 3.0:
+        if phase == "processing":
             # Active processing phase
-            state = InterlocutorState.PROCESSING
             if self._silence_start is None:
                 self._silence_start = ts
             silence_ms = (ts - self._silence_start) * 1000
 
             return NonVerbalSignals(
                 timestamp=ts,
-                state=state,
+                state=InterlocutorState.PROCESSING,
                 confidence=0.82,
                 gaze_direction="internal",
                 eye_contact=False,
@@ -209,7 +223,7 @@ class OutwardPerceptionLayer:
                 silence_duration_ms=silence_ms,
             )
 
-        elif elapsed < 5.0:
+        elif phase == "response_ready":
             # Preparing to respond
             self._silence_start = None
             return NonVerbalSignals(
@@ -228,6 +242,7 @@ class OutwardPerceptionLayer:
             )
         else:
             # Listening
+            self._silence_start = None
             return NonVerbalSignals(
                 timestamp=ts,
                 state=InterlocutorState.LISTENING,
@@ -260,7 +275,12 @@ class SilenceMonitor:
     """
     Audio-based silence and pre-speech detection.
     Lower privacy cost than video: detects acoustic patterns only.
-    Usable with unilateral consent (no biometric facial data).
+
+    NOTE: this class does not decide its own consent requirement. It used to
+    return `"requires_bilateral": False` in its own output, i.e. a component
+    self-certifying that it needed no bilateral consent. Consent is decided by
+    core.bilateral_consent.CONSENT_MANAGER and nowhere else. What this class can
+    honestly report is that it produces no biometric facial data.
 
     Detects:
     - Silence duration and pattern
@@ -294,6 +314,7 @@ class SilenceMonitor:
             "in_silence":         self._in_silence,
             "silence_duration_ms": silence_ms,
             "pre_speech_breath":  is_breath_pattern,
-            "audio_only":         True,   # No biometric data
-            "requires_bilateral": False,  # Audio monitoring, not biometric
+            "audio_only":         True,   # No biometric facial data produced
+            "consent_note":       "Consent policy is CONSENT_MANAGER's decision, "
+                                  "not this component's.",
         }

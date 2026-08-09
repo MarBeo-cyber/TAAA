@@ -15,9 +15,17 @@ stored as validated patterns in the M0 knowledge graph.
 The 8-step cycle (adapted for schema translation):
   G1 → P1 → C2 → R1 → G2 → P2 → C1 → R2
 
-Scoring function:
+Intended scoring function (design target, NOT what this file computes):
   Score = w1*FedeltaCulturale + w2*NavigabilitaSoggetto +
           w3*PreservazioneDiversita + w4*Robustezza + w5*CostoLatenza
+
+WHAT IS ACTUALLY IMPLEMENTED
+  The adversarial cycle (G→P→C→R, both directions) is real and runs against the
+  LLM. The *scoring* is not. `_shape_heuristics` inspects the proposal's length
+  and looks for a handful of connective words; it never measures cultural
+  fidelity, navigability, diversity preservation or robustness. Its output is
+  therefore named `heuristic_score`, is flagged by `score_basis`, and is None
+  when no LLM ran. It is not a validation metric and must not be reported as one.
 
 The Rosetta Stone principle:
   The goal is NOT a neutral arbiter (doesn't exist).
@@ -27,12 +35,16 @@ The Rosetta Stone principle:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger("taaa.cav")
+
+
+class _LLMUnavailable(RuntimeError):
+    """The adversarial cycle could not be run. Not a scoring outcome."""
+
 
 try:
     import anthropic
@@ -74,37 +86,57 @@ is in the genuine tension between perspectives."""
 
 @dataclass
 class TranslationProposal:
-    """A proposed schema translation with evaluation."""
+    """A proposed schema translation with its (heuristic) shape scores.
+
+    Every *_heuristic field below is a function of the proposal's text shape —
+    length and the presence of connective words — not of its cultural content.
+    """
     proposal: str
-    cultural_source: str         # "western" | "eastern"
-    fidelity_score: float        # Cultural fidelity 0–1
-    navigability_score: float    # Subject can process without extra effort 0–1
-    diversity_score: float       # Preserves both schemas without merging 0–1
-    robustness_score: float      # Stable under cultural perturbation 0–1
+    cultural_source: str            # "western" | "eastern"
+    fidelity_heuristic: float       # proxy: proposal length
+    navigability_heuristic: float   # constant; no navigability model exists
+    diversity_heuristic: float      # proxy: absence of merger vocabulary
+    robustness_heuristic: float     # proxy: presence of contrastive connectives
     critique: Optional[str] = None
     refined: Optional[str] = None
 
 
 @dataclass
-class CAVResult:
-    """Final output of the adversarial validation cycle."""
-    validated_translation: str
-    composite_score: float
-    western_score: float
-    eastern_score: float
-    diversity_preserved: bool
+class CAVReport:
+    """Output of the adversarial cycle.
+
+    Named a report, not a result, and `heuristic_score`, not `composite_score`:
+    nothing here is a validation metric. `adversarially_validated` is True only
+    when the two-prior LLM cycle actually ran.
+    """
+    translation: str
+    adversarially_validated: bool
+    score_basis: str              # "text_shape_heuristic" | "unavailable_no_llm"
+    heuristic_score: Optional[float]
+    western_heuristic: Optional[float]
+    eastern_heuristic: Optional[float]
+    diversity_heuristic: Optional[float]
     proposals_evaluated: int
     convergence_note: str
     rosetta_stone_analogy: str    # What both perspectives share
+    caveat: str = (
+        "heuristic_score measures text shape (length, connectives), not "
+        "cultural fidelity. Do not report it as a validation score."
+    )
 
 
 class CulturalAdversarialValidator:
     """
-    Adversarial cross-cultural schema translation validator.
+    Adversarial cross-cultural schema translation cycle.
+
+    The cycle (two culturally primed model instances generating, perturbing,
+    critiquing and refining each other's proposals) is implemented. The scoring
+    is not: WEIGHTS below are applied to the text-shape heuristics in
+    _shape_heuristics, which do not measure the quantities they are named after.
 
     Weights for daily domain (emergency uses pre-computed cached results):
     w1=0.25 (fidelity), w2=0.25 (navigability), w3=0.30 (diversity),
-    w4=0.15 (robustness), w5=0.05 (latency — minimal in daily domain)
+    w4=0.15 (robustness), w5=0.05 (latency — not currently applied)
     """
 
     WEIGHTS = {
@@ -115,21 +147,39 @@ class CulturalAdversarialValidator:
         "latency":       0.05,
     }
 
-    def validate(self,
-                 scenario: str,
-                 source_schema: str,
-                 target_schema: str,
-                 subject_profile: Optional[dict] = None,
-                 max_cycles: int = 2) -> CAVResult:
+    def run_cycle(self,
+                  scenario: str,
+                  source_schema: str,
+                  target_schema: str,
+                  subject_profile: Optional[dict] = None,
+                  max_cycles: int = 2) -> CAVReport:
         """
-        Run the adversarial validation cycle.
+        Run the adversarial cycle. Renamed from validate(): without a working
+        LLM nothing is validated, and even with one the scores are heuristics.
+
         max_cycles: number of G→P→C→R rounds (2 is sufficient for most cases)
         """
         if not _LLM_AVAILABLE:
-            return self._fallback_result(scenario, source_schema, target_schema)
+            return self._unavailable_report(scenario, source_schema, target_schema)
 
         proposals: list[TranslationProposal] = []
 
+        try:
+            self._run_rounds(proposals, scenario, source_schema, target_schema,
+                             max_cycles)
+        except _LLMUnavailable as e:
+            # A constructed client with no valid key looks available at import
+            # time and fails at request time. Previously _call_llm swallowed
+            # that and returned "", so the cycle "completed" on empty strings
+            # and reported adversarially_validated=True with a score of 0.623.
+            logger.warning("[CAV] adversarial cycle aborted: %s", e)
+            return self._unavailable_report(scenario, source_schema, target_schema,
+                                            reason=str(e))
+
+        return self._synthesise(proposals, scenario, source_schema, target_schema)
+
+    def _run_rounds(self, proposals: list, scenario: str, source_schema: str,
+                    target_schema: str, max_cycles: int) -> None:
         for cycle in range(max_cycles):
             # G1: Western generates proposal
             w_proposal = self._generate(scenario, source_schema, target_schema,
@@ -142,7 +192,7 @@ class CulturalAdversarialValidator:
             w_refined = self._refine(w_perturbed, e_critique, "western", prior=WESTERN_ANALYTIC_PRIOR)
             proposals.append(TranslationProposal(
                 proposal=w_refined, cultural_source="western",
-                **self._score(w_refined, "western"), critique=e_critique
+                **self._shape_heuristics(w_refined), critique=e_critique
             ))
 
             # G2: Eastern generates
@@ -156,12 +206,11 @@ class CulturalAdversarialValidator:
             e_refined = self._refine(e_perturbed, w_critique, "eastern", prior=EASTERN_HOLISTIC_PRIOR)
             proposals.append(TranslationProposal(
                 proposal=e_refined, cultural_source="eastern",
-                **self._score(e_refined, "eastern"), critique=w_critique
+                **self._shape_heuristics(e_refined), critique=w_critique
             ))
 
-        return self._synthesise(proposals, scenario, source_schema, target_schema)
-
     def _call_llm(self, system: str, prompt: str, max_tokens: int = 400) -> str:
+        """Raise rather than return "" — an empty proposal is not a proposal."""
         try:
             resp = _CLIENT.messages.create(
                 model="claude-sonnet-4-20250514",
@@ -169,10 +218,12 @@ class CulturalAdversarialValidator:
                 system=system,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return resp.content[0].text.strip()
+            text = resp.content[0].text.strip()
         except Exception as e:
-            logger.warning("[CAV] LLM call failed: %s", e)
-            return ""
+            raise _LLMUnavailable(str(e)) from e
+        if not text:
+            raise _LLMUnavailable("model returned an empty response")
+        return text
 
     def _generate(self, scenario: str, source: str, target: str,
                   culture: str, prior: str) -> str:
@@ -206,54 +257,69 @@ class CulturalAdversarialValidator:
                   f"The goal is interoperability, not merger.")
         return self._call_llm(prior, prompt, max_tokens=300)
 
-    def _score(self, proposal: str, cultural_source: str) -> dict:
-        """Simplified scoring — full implementation uses LLM evaluator."""
-        # Heuristic scoring based on proposal length and structure
-        has_both_perspectives = len(proposal) > 100
-        is_specific = any(w in proposal.lower() for w in
-                         ["because", "while", "whereas", "however", "instead"])
-        avoids_merger = "both" not in proposal.lower() or "integrate" not in proposal.lower()
+    def _shape_heuristics(self, proposal: str) -> dict:
+        """Text-shape proxies. NOT cultural measurements.
+
+        Every branch below is a hand-picked constant selected by the author, so
+        the reachable range of the weighted combination is 0.5325 – 0.7075 — a
+        span of 0.175 that is entirely determined by three string tests. Kept
+        because it is the only thing available without an evaluator model, and
+        renamed so nobody reads it as a validation score.
+        """
+        text = proposal.lower()
+        is_long = len(proposal) > 100
+        is_specific = any(w in text for w in
+                          ["because", "while", "whereas", "however", "instead"])
+        # False only when the proposal talks about BOTH merging and integrating.
+        avoids_merger = not ("both" in text and "integrate" in text)
 
         return {
-            "fidelity_score":     0.75 if has_both_perspectives else 0.5,
-            "navigability_score": 0.70,
-            "diversity_score":    0.80 if avoids_merger else 0.50,
-            "robustness_score":   0.70 if is_specific else 0.55,
+            "fidelity_heuristic":     0.75 if is_long else 0.5,
+            "navigability_heuristic": 0.70,           # constant: no model
+            "diversity_heuristic":    0.80 if avoids_merger else 0.50,
+            "robustness_heuristic":   0.70 if is_specific else 0.55,
         }
 
     def _synthesise(self, proposals: list[TranslationProposal],
-                    scenario: str, source: str, target: str) -> CAVResult:
+                    scenario: str, source: str, target: str) -> CAVReport:
         if not proposals:
-            return self._fallback_result(scenario, source, target)
+            return self._unavailable_report(scenario, source, target)
 
-        # Weighted scoring per proposal
-        def composite(p: TranslationProposal) -> float:
+        # Weighted combination of the shape heuristics above.
+        def combined(p: TranslationProposal) -> float:
             w = self.WEIGHTS
-            return (w["fidelity"]     * p.fidelity_score +
-                    w["navigability"] * p.navigability_score +
-                    w["diversity"]    * p.diversity_score +
-                    w["robustness"]   * p.robustness_score)
+            return (w["fidelity"]     * p.fidelity_heuristic +
+                    w["navigability"] * p.navigability_heuristic +
+                    w["diversity"]    * p.diversity_heuristic +
+                    w["robustness"]   * p.robustness_heuristic)
 
-        best = max(proposals, key=composite)
-        best_score = composite(best)
+        best = max(proposals, key=combined)
+        best_score = combined(best)
 
         western_proposals = [p for p in proposals if p.cultural_source == "western"]
         eastern_proposals = [p for p in proposals if p.cultural_source == "eastern"]
-        w_score = composite(western_proposals[-1]) if western_proposals else 0.0
-        e_score = composite(eastern_proposals[-1]) if eastern_proposals else 0.0
+        w_score = combined(western_proposals[-1]) if western_proposals else None
+        e_score = combined(eastern_proposals[-1]) if eastern_proposals else None
 
-        convergence = (
-            "Strong convergence — both frameworks reached similar conclusions."
-            if abs(w_score - e_score) < 0.15
-            else "Productive tension — frameworks maintain distinct perspectives."
-        )
+        if w_score is not None and e_score is not None:
+            convergence = (
+                "Both proposals scored within 0.15 on the shape heuristic. This "
+                "says nothing about whether the frameworks agree."
+                if abs(w_score - e_score) < 0.15
+                else "Shape heuristics differ by more than 0.15 between the two "
+                     "proposals. Read the two texts; the number is not evidence."
+            )
+        else:
+            convergence = "Only one cultural prior produced a proposal."
 
-        return CAVResult(
-            validated_translation=best.proposal,
-            composite_score=round(best_score, 3),
-            western_score=round(w_score, 3),
-            eastern_score=round(e_score, 3),
-            diversity_preserved=best.diversity_score > 0.65,
+        return CAVReport(
+            translation=best.proposal,
+            adversarially_validated=True,
+            score_basis="text_shape_heuristic",
+            heuristic_score=round(best_score, 3),
+            western_heuristic=round(w_score, 3) if w_score is not None else None,
+            eastern_heuristic=round(e_score, 3) if e_score is not None else None,
+            diversity_heuristic=best.diversity_heuristic,
             proposals_evaluated=len(proposals),
             convergence_note=convergence,
             rosetta_stone_analogy=(
@@ -263,16 +329,24 @@ class CulturalAdversarialValidator:
             )
         )
 
-    def _fallback_result(self, scenario: str,
-                         source: str, target: str) -> CAVResult:
-        return CAVResult(
-            validated_translation=f"Bridge between '{source}' and '{target}' schemas. "
-                                   f"Context: {scenario[:100]}",
-            composite_score=0.5,
-            western_score=0.5,
-            eastern_score=0.5,
-            diversity_preserved=True,
+    def _unavailable_report(self, scenario: str,
+                            source: str, target: str,
+                            reason: str = "no anthropic client") -> CAVReport:
+        """No LLM: say so. Do not emit 0.5 as if it were a measurement."""
+        logger.info("[CAV] no adversarial cycle: %s", reason)
+        return CAVReport(
+            translation=(f"[template, not a validated translation] Bridge between "
+                         f"'{source}' and '{target}' schemas. "
+                         f"Context: {scenario[:100]}"),
+            adversarially_validated=False,
+            score_basis="unavailable_no_llm",
+            heuristic_score=None,
+            western_heuristic=None,
+            eastern_heuristic=None,
+            diversity_heuristic=None,
             proposals_evaluated=0,
-            convergence_note="Fallback — LLM unavailable.",
-            rosetta_stone_analogy="Full CAV requires LLM. Fallback active."
+            convergence_note=(f"No adversarial cycle ran ({reason}). "
+                              "Nothing was cross-validated."),
+            rosetta_stone_analogy=("The adversarial cycle needs two culturally "
+                                   "primed model instances. None were available."),
         )

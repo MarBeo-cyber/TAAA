@@ -8,6 +8,13 @@ Architecture changes from v0.3:
   - Trigger: pre-speech signals from David + active processing from Tanaka-san
   - In-moment intervention: ONLY pre-calibrated haptic signal (no text)
   - Debrief: full explanation delivered after natural pause
+
+WHAT IS SIMULATED HERE
+  OutwardPerceptionLayer runs in simulation_mode and replays a hand-written
+  signal set; this script asks for the "processing" phase explicitly. MAABridge
+  is a protocol sketch with no MAAA behind it (see core/maaa_bridge.py). What is
+  real: the bilateral consent state machine in core/bilateral_consent.py, which
+  genuinely gates the observation, and the MAAA 9-word constraint check.
 """
 
 from __future__ import annotations
@@ -59,7 +66,7 @@ def run_bilateral_negotiation():
         session_type="negotiation",
     )
     print(f"  David:      Traduttore cognitivo attivato [token: {session.invite_token}]")
-    print(f"  → Condivide token con Tanaka-san\n")
+    print("  → Condivide token con Tanaka-san\n")
 
     # Tanaka-san joins
     session = CONSENT_MANAGER.join_session(
@@ -67,10 +74,10 @@ def run_bilateral_negotiation():
         joiner_subject_id="tanaka_osaka",
         joiner_device_id="device_tanaka_glasses",
     )
-    print(f"  Tanaka-san: Traduttore cognitivo accettato ✓")
+    print("  Tanaka-san: Traduttore cognitivo accettato ✓")
 
     display = session.to_display()
-    print(f"\n  Stato sessione:")
+    print("\n  Stato sessione:")
     print(f"    Livello consenso:       {display['consent_level'].upper()}")
     print(f"    Monitoring outward:     {'ATTIVO' if display['outward_active'] else 'INATTIVO'}")
     print(f"    Tipo:                   {display['session_type']}")
@@ -106,48 +113,68 @@ def run_bilateral_negotiation():
     permitted, reason = CONSENT_MANAGER.check_outward_permitted("david_us_executive")
     print(f"  Outward monitoring: {'AUTORIZZATO — consenso bilaterale' if permitted else 'NEGATO: ' + reason}")
 
+    obs = None
     if permitted:
+        # sim_phase is explicit. The simulator used to pick a phase from
+        # `time.time() % 10`, so this script narrated "elaborazione attiva"
+        # while the layer was actually returning state=listening.
         obs = outward.observe(
             observer_subject_id="david_us_executive",
             interlocutor_profile={"culture": "east_asian", "subject_id": "tanaka_osaka"},
             scenario_context="after_yes_silence",
+            sim_phase="processing",
         )
         sig = obs.signals
-        print(f"\n  Segnali rilevati:")
+        print("  [SIMULAZIONE — segnali generati da uno script, non misurati]")
+        print("\n  Segnali rilevati:")
         print(f"    Stato:              {sig.state.value}")
-        print(f"    Sguardo:            {sig.gaze_direction} (non verso David)")
-        print(f"    Pre-speech breath:  {'SÌ — pronto a parlare' if sig.pre_speech_breath else 'NO — elaborazione attiva'}")
-        print(f"    Silenzio attivo:    {'SÌ — silenzio vivo, non vuoto' if sig.silence_active else 'NO'}")
+        print(f"    Sguardo:            {sig.gaze_direction}")
+        print(f"    Pre-speech breath:  {'SÌ' if sig.pre_speech_breath else 'NO'}")
+        print(f"    Silenzio attivo:    {'SÌ' if sig.silence_active else 'NO'}")
         print(f"    Micro-espressione:  {sig.micro_expression or '—'}")
         print(f"    Durata silenzio:    {sig.silence_duration_ms:.0f}ms (individuale, non timer)")
+        # Derived from the property, not asserted alongside it.
+        print(f"    Elaborazione attiva: {'SÌ — silenzio vivo, non vuoto' if sig.is_processing_active else 'NO'}")
         print(f"\n  Raccomandazione trigger: {obs.trigger_recommendation}")
-        print(f"  [Il sistema NON misura la durata — legge i segnali]")
+        print("  [Il sistema NON misura la durata — legge i segnali]")
 
     # ── Phase 4: Pre-calibrated signal to David ───────────────────────────────
     print(f"\n{DIVIDER}")
     print("  FASE 3 — Intervento pre-calibrato (in-momento)")
     print(f"{DIVIDER}\n")
 
+    if obs is None or obs.trigger_recommendation != "wait":
+        state = obs.signals.state.value if obs else "non osservato"
+        print(f"  Nessun intervento: la raccomandazione non è 'wait' "
+              f"(stato interlocutore: {state}).")
+        print("  Il TAAA resta silenzioso. Fine dello scenario.")
+        CONSENT_MANAGER.end_session(session.session_id)
+        return
+
     # Detect: David shows pre-speech signals (about to fill the silence)
-    print("  [MAAA L3 rileva segnali pre-verbali di David]")
+    print("  [MAAA L3 — stato derivato dallo scenario, non da sensori]")
     maaa_state = bridge.get_human_state(scenario_stress=0.15)
     print(f"  Stato David:     {maaa_state.cognitive_state} | "
           f"receptivity={maaa_state.receptivity}")
-    print(f"  David sta per:   INTERROMPERE il silenzio (segnale pre-verbale rilevato)")
+    print("  David sta per:   INTERROMPERE il silenzio (assunzione dello scenario)")
     print()
 
     # Build pre-calibrated signal — NO text in real-time
     signal = bridge.build_pre_calibrated_signal("cultural_pause", m_level="M1")
-    injected = bridge.inject_to_maaa(signal)
+    accepted = bridge.inject_to_maaa(signal)
 
-    print(f"  Intervento TAAA → MAAA:")
-    print(f"    Tipo:           segnale pre-calibrato (addestrato in setup)")
+    print("  Intervento TAAA → MAAA:")
+    print("    Tipo:           segnale pre-calibrato (addestrato in setup)")
     print(f"    Aptico:         {signal.haptic_pattern}")
     print(f"    AR:             {signal.ar_overlay}")
     print(f"    Voce:           {'nessuna — NO testo in real-time' if not signal.voice_message else signal.voice_message}")
     print(f"    Urgenza:        {signal.urgency}")
-    print(f"\n  David sente il buzz — sa (dal training) che significa: ASPETTA")
-    print(f"  Non legge nulla. Non viene distratto. Non viene interrotto.")
+    print(f"    Accettato dai filtri MAAA: {accepted}")
+    if accepted:
+        print("\n  David sente il buzz — sa (dal training) che significa: ASPETTA")
+        print("  Non legge nulla. Non viene distratto. Non viene interrotto.")
+    else:
+        print("\n  Segnale rifiutato dai filtri MAAA — nessun buzz consegnato.")
 
     # ── Phase 5: David waits ──────────────────────────────────────────────────
     print(f"\n{DIVIDER}")
@@ -178,26 +205,26 @@ def run_bilateral_negotiation():
     )
     bridge.inject_to_maaa(debrief)
 
-    print(f"  [Scheda debrief appare sugli occhiali di David — pausa naturale]")
-    print(f"\n  ┌─────────────────────────────────────────────────────┐")
-    print(f"  │  SCHEMA GAP — M1 Cultural Bridge                    │")
-    print(f"  │                                                      │")
-    print(f"  │  'Yes' di Tanaka-san = ho compreso la proposta      │")
-    print(f"  │  Silenzio = elaborazione rispettosa, non assenza     │")
-    print(f"  │  Risposta = rifiuto indiretto cortese                │")
-    print(f"  │                                                      │")
-    print(f"  │  silence_as_absence → silence_as_respect             │")
-    print(f"  └─────────────────────────────────────────────────────┘")
+    print("  [Scheda debrief appare sugli occhiali di David — pausa naturale]")
+    print("\n  ┌─────────────────────────────────────────────────────┐")
+    print("  │  SCHEMA GAP — M1 Cultural Bridge                    │")
+    print("  │                                                      │")
+    print("  │  'Yes' di Tanaka-san = ho compreso la proposta      │")
+    print("  │  Silenzio = elaborazione rispettosa, non assenza     │")
+    print("  │  Risposta = rifiuto indiretto cortese                │")
+    print("  │                                                      │")
+    print("  │  silence_as_absence → silence_as_respect             │")
+    print("  └─────────────────────────────────────────────────────┘")
 
-    print(f"\n  Sessione TAAA:")
+    print("\n  Sessione TAAA:")
     print(f"    Iniezioni MAAA:    {bridge.injection_count}")
-    print(f"    Monitoring:        bilaterale consensuale")
-    print(f"    Testo in real-time: NESSUNO")
-    print(f"    Schema preservati: entrambi — nessuna omologazione")
+    print("    Monitoring:        bilaterale consensuale")
+    print("    Testo in real-time: NESSUNO")
+    print("    Schema preservati: entrambi — nessuna omologazione")
 
     # End session
     CONSENT_MANAGER.end_session(session.session_id)
-    print(f"\n  [Sessione traduttore cognitivo chiusa]")
+    print("\n  [Sessione traduttore cognitivo chiusa]")
 
 
 if __name__ == "__main__":

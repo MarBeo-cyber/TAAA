@@ -25,9 +25,8 @@ References:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from enum import Enum, auto
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 
@@ -40,7 +39,8 @@ class PrimitiveClass(Enum):
 
 
 class Primitive(Enum):
-    """All conceptual primitives from Hedblom et al. DISL (2024)."""
+    """Conceptual primitives from Hedblom et al. DISL (2024),
+    plus explicitly-marked TAAA extensions (see BOUNDARY)."""
     # Spatial entity primitives
     OBJECT          = ("OBJECT",        PrimitiveClass.SPATIAL)
     CONTAINER       = ("CONTAINER",     PrimitiveClass.SPATIAL)
@@ -78,6 +78,15 @@ class Primitive(Enum):
     ACTIVE_UMPH     = ("ACTIVE_UMPH",   PrimitiveClass.FORCE_DYNAMIC)
     PASSIVE_UMPH    = ("PASSIVE_UMPH",  PrimitiveClass.FORCE_DYNAMIC)
 
+    # ── TAAA extension — NOT in DISL Table 1 ─────────────────────────────────
+    # The surface separating a supported region from a drop. FALLING_DANGER and
+    # the visual cliff are about crossing this surface, which is not the same
+    # relation as CONTAINER (inside/outside a volume). FALLING_DANGER used to be
+    # written as `Primitive.BOUNDARY if hasattr(...) else Primitive.CONTAINER`
+    # against an enum that had no BOUNDARY, so it silently shipped CONTAINER
+    # while its description and ar_output both said boundary.
+    BOUNDARY        = ("BOUNDARY",      PrimitiveClass.SPATIAL)
+
     def __init__(self, label: str, cls: PrimitiveClass):
         self.label = label
         self.primitive_class = cls
@@ -101,7 +110,8 @@ class ImageSchema:
     haptic_pattern: str              # Haptic output pattern
 
     def __repr__(self):
-        return f"ImageSchema({self.name}, primitives={len(self.primitives)}, emergency={self.emergency_relevance:.1f})"
+        return (f"ImageSchema({self.name}, primitives={len(self.primitives)}, "
+                f"emergency={self.emergency_relevance:.1f})")
 
 
 # ── M0 Emergency Subset Taxonomy ─────────────────────────────────────────────
@@ -113,8 +123,8 @@ M0_EMERGENCY_SCHEMAS: list[ImageSchema] = [
 
     ImageSchema(
         name="FALLING_DANGER",
-        primitives=[Primitive.DOWN, Primitive.BOUNDARY if hasattr(Primitive, 'BOUNDARY')
-                    else Primitive.CONTAINER, Primitive.ANIMATE_MOTION, Primitive.PASSIVE_UMPH],
+        primitives=[Primitive.DOWN, Primitive.BOUNDARY,
+                    Primitive.ANIMATE_MOTION, Primitive.PASSIVE_UMPH],
         description=(
             "Discontinuity below the agent that would cause downward motion "
             "under gravity if boundary is crossed. The paradigm case is the visual cliff."

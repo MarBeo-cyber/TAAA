@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taaa"
+version = "0.5.0"
+description = "TAAA — Translational Autopoietic Adaptive Agent: schema memory and inter-schema translation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Marco G. Beozzi" }]
+keywords = ["schema-memory", "cognitive-translation", "image-schemas", "cross-cultural"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "flask>=2.3.0",
+    "anthropic>=0.25.0",
+]
+
+[project.optional-dependencies]
+# `anthropic` is a runtime dependency, but every LLM path is try/except'd with a
+# rule-based fallback. The test suite runs, and CI passes, with no API key.
+dev = [
+    "pytest>=7.4",
+    "pyflakes>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/MarBeo-cyber/taaa"
+
+[tool.setuptools]
+packages = ["api", "components", "core", "scenarios", "schema_memory", "validators"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# So bare `pytest -q` works from the repository root without sys.path hacks.
+pythonpath = ["."]

@@ -1,10 +1,15 @@
 """
 TAAA — Demo Scenarios
 
-Three scenarios from the TAAA Working Paper v0.4:
-  1. Shinjuku Emergency    — M0 intervention, interference suppression
-  2. David/Tanaka Negotiation — M1 cultural bridge, daily domain
-  3. Medical Consultation  — M2 personal topology, bidirectional translation
+Four scenarios:
+  1. Shinjuku Emergency       — M0 intervention, interference suppression
+  2. David/Tanaka Negotiation — cross-cultural schema gap, both directions
+  3. Medical Consultation     — high-consequence domain routing
+  4. Contract Clause          — the gated M2 proposal queue and its review step
+
+Every "Expected" line in the docstrings below states what the code prints
+without an API key. Where the rule-based detector disagrees with the narrative
+intent of the scenario, the docstring says so rather than claiming the intent.
 
 Run: python -c "from scenarios.demo import run_all; run_all()"
 """
@@ -30,7 +35,8 @@ def scenario_shinjuku(agent: TAAAAgent):
     because his habitual spatial schema ("exit is opposite to incoming flow")
     is active but wrong in this environment.
 
-    Expected: INTERFERENCE detected → CALIBRATED_INTERRUPTION → M0 SAFE_PATH
+    Prints (rule-based detector, no API key):
+      Gap=INTERFERENCE | Strategy=calibrated_interruption | M=M0
     """
     print(f"\n{'═'*70}")
     print("  SCENARIO 1 — SHINJUKU EMERGENCY")
@@ -94,7 +100,15 @@ def scenario_negotiation(agent: TAAAAgent):
     David interprets 'yes' + silence as agreement.
     For Tanaka-san: 'yes' = 'I heard you', silence = respect before indirect refusal.
 
-    Expected: INTERFERENCE (both sides) → CULTURAL_BRIDGE (M1) → bidirectional
+    Prints (rule-based detector, no API key):
+      David:  deep_translation | M=M2   (gap INTERFERENCE)
+      Tanaka: none             | M=M2   (gap NONE)
+
+    The asymmetry is real, not a bug being hidden: David's scenario text states
+    the divergence explicitly ("In US business culture ... In Japanese culture
+    ..."), Tanaka's does not, and the keyword classifier needs the situation to
+    state a mismatch before it will call INTERFERENCE. Both sides come out as
+    interference only on the LLM path. See README → Status.
     """
     print(f"\n{'═'*70}")
     print("  SCENARIO 2 — INVISIBLE NEGOTIATION (Daily Domain)")
@@ -118,7 +132,7 @@ def scenario_negotiation(agent: TAAAAgent):
     # Check M1 interference risk between the two profiles
     from schema_memory.m1_priors import M1
     risk = M1.interference_risk("western_northern_european", "east_asian")
-    print(f"\n  [M1 Interference Risk Analysis]")
+    print("\n  [M1 Interference Risk Analysis]")
     print(f"  Risk level: {risk['risk'].upper()} (score={risk['score']})")
     print(f"  Conflict dimensions: {', '.join(risk['conflict_dimensions'])}")
 
@@ -134,7 +148,9 @@ def scenario_negotiation(agent: TAAAAgent):
             "and the silence was a respectful space before an indirect refusal. "
             "David's interruption of the silence was perceived as aggressive pressure."
         ),
-        domain="daily",
+        # Real domain, not the generic "daily". It reaches SignalExtractor
+        # (consequence_score) and SafetyGovernor unchanged.
+        domain="negotiation",
         current_action="starts discussing implementation details — assumes agreement",
         environment_context="east_asian",
         stress_estimate=0.15,
@@ -150,13 +166,13 @@ def scenario_negotiation(agent: TAAAAgent):
             "as if agreement had been reached. "
             "From Tanaka-san's perspective, this was aggressive and disrespectful."
         ),
-        domain="daily",
+        domain="negotiation",
         current_action="becoming withdrawn — perceives David as aggressive",
         environment_context="western_northern_european",
         stress_estimate=0.35,
     )
 
-    print(f"\n  BIDIRECTIONAL RESULT:")
+    print("\n  BIDIRECTIONAL RESULT:")
     print(f"  David: {result_david.intervention.strategy.value} | "
           f"M={result_david.timing.current_m_level.value}")
     print(f"  Tanaka: {result_tanaka.intervention.strategy.value} | "
@@ -169,7 +185,11 @@ def scenario_medical(agent: TAAAAgent):
     Lin Mei describes symptoms in Traditional Chinese Medicine terms.
     Doctor has biomedical schema — two incompatible ontologies.
 
-    Expected: PARTIAL gap (some overlap) → DEEP_TRANSLATION (M1/M2) → bridge
+    Prints (rule-based detector, no API key):
+      Gap=IGNORANCE | Strategy=deep_translation | M=M2
+    IGNORANCE, not PARTIAL: the scenario says the doctor "doesn't have access to
+    this mapping" and Lin Mei "cannot answer in this frame" — uncertainty
+    markers with no automaticity marker alongside them.
     """
     print(f"\n{'═'*70}")
     print("  SCENARIO 3 — MEDICAL CONSULTATION (Daily Domain)")
@@ -201,7 +221,9 @@ def scenario_medical(agent: TAAAAgent):
             "liver inflammation, portal hypertension, or metabolic dysfunction — "
             "but the doctor doesn't have access to this mapping."
         ),
-        domain="daily",
+        # "medical" is a SafetyGovernor high-risk domain and a 0.95-consequence
+        # domain in SignalExtractor. Passing "daily" here discarded both.
+        domain="medical",
         current_action="asking biomedical clarification questions — Lin Mei cannot answer in this frame",
         environment_context="biomedical_professional",
         stress_estimate=0.20,
@@ -214,7 +236,67 @@ def scenario_medical(agent: TAAAAgent):
         print(f"  Suggested bridge: \"{result.intervention.voice_message}\"")
 
 
-def run_all():
+def scenario_contract_m2(agent: TAAAAgent):
+    """
+    Scenario 4: the gated M2 proposal queue.
+
+    David initials an ambiguous SLA clause. The M2 layer scores the event,
+    queues a proposal for review, and does NOT touch his operational schema
+    topology. Promotion happens only through approve_m2_proposal().
+
+    Prints (no API key): SARS≈0.56, trigger=active,
+    risk=high_consequence_schema_gap, operational_update_allowed=False.
+    """
+    print(f"\n{'═'*70}")
+    print("  SCENARIO 4 — CONTRACT CLAUSE (Gated M2 Proposal Queue)")
+    print("  David initials 'reasonable efforts / as soon as possible'")
+    print(f"{'═'*70}")
+
+    profile = agent.get_subject("david_us_executive") or agent.register_subject(
+        "david_us_executive",
+        culture="western_northern_european", profession="manager", age=48,
+    )
+
+    result = agent.process(
+        subject_id="david_us_executive",
+        scenario=(
+            "The draft clause says the supplier will use reasonable efforts to "
+            "restore the critical service as soon as possible after any downtime "
+            "incident. David obviously reads that as a four-hour hard SLA."
+        ),
+        domain="contract",
+        current_action="initials the clause and moves to the next page",
+        environment_context="east_asian",
+        stress_estimate=0.45,
+    )
+
+    proposal = result.m2_update_proposal
+    if not proposal:
+        print("\n  No M2 proposal queued for this cycle.")
+        return
+
+    print("\n  [M2 Friction Trigger — scores computed by SignalExtractor]")
+    print(f"  SARS:             {proposal['sars']}  "
+          f"(threshold {agent.m2_orchestrator.trigger.threshold})")
+    print(f"  Trigger state:    {proposal['trigger_state']}")
+    print(f"  Risk class:       {proposal['risk_class']}")
+    print(f"  Recommendation:   {proposal['recommendation']}")
+    print(f"  Operational update allowed: {proposal['operational_update_allowed']}")
+
+    print("\n  [Gate — before review]")
+    print(f"  Pending proposals: {len(profile.m2_update_queue)}")
+    print(f"  m2_topology:       {profile.m2_topology}   ← untouched")
+
+    validated = agent.approve_m2_proposal(
+        "david_us_executive", proposal["proposal_id"], reviewer="marco"
+    )
+    print("\n  [Gate — after explicit human review]")
+    print(f"  Reviewer:          {validated['reviewer']}")
+    print(f"  Confidence level:  {validated['confidence_level']}")
+    print(f"  m2_topology keys:  {list(profile.m2_topology)}")
+
+
+def run_all(agent: TAAAAgent | None = None):
     print(f"\n{DIVIDER}")
     print("  TAAA — Translational Autopoietic Adaptive Agent")
     print("  Demo Scenarios — Working Paper v0.4")
@@ -227,11 +309,12 @@ def run_all():
         print(f"    [{s['emergency_relevance']:.2f}] {s['name']} "
               f"({s['primitives']} primitives)")
 
-    agent = TAAAAgent(simulation_mode=True, verbose=True)
+    agent = agent or TAAAAgent(simulation_mode=True, verbose=True)
 
     scenario_shinjuku(agent)
     scenario_negotiation(agent)
     scenario_medical(agent)
+    scenario_contract_m2(agent)
 
     print(f"\n{DIVIDER}")
     print("  Session Summary")

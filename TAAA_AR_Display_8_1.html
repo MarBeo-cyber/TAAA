@@ -1,8 +1,23 @@
 <!DOCTYPE html>
+<!--
+  NON-FUNCTIONAL DESIGN MOCK-UP.
+
+  This file is a storyboard, not an interface. Its scenarios are {delay, action}
+  steps replayed with setTimeout, and every value it displays — "INTERFERENCE
+  (conf=0.72)", "0.82 | HRV=22ms", "PARTIAL (conf=0.68)" — is a typed constant.
+  It never contacts the TAAA pipeline: there is no EventSource and no fetch in
+  this document. PARTIAL (conf=0.68) in particular is a number the pipeline
+  cannot produce; the rule-based detector emits a rule id, not a confidence.
+
+  It is kept because it is a useful visual design reference.
+
+  For a display driven by the real pipeline, run `python main_taaa.py server`
+  and open http://localhost:5004/ar  (source: api/ar_display.py).
+-->
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<title>TAAA — AR Glasses Display</title>
+<title>TAAA — AR Glasses Display (design mock-up, not live)</title>
 <style>
   :root {
     --bg: #050810;
@@ -424,6 +439,13 @@
 </style>
 </head>
 <body>
+<div style="max-width:900px;margin:0 auto 14px;padding:10px 14px;
+            border:1px solid #ffaa00;border-radius:8px;color:#ffaa00;
+            font-family:'SF Mono',monospace;font-size:12px;line-height:1.6">
+  <strong>DESIGN MOCK-UP — NOT CONNECTED TO THE TAAA PIPELINE.</strong><br>
+  Every number below is a typed constant replayed on a timer. For the live HUD,
+  run <code>python main_taaa.py server</code> and open <code>/ar</code>.
+</div>
 <h1>⬡ TAAA — AR Glasses Simulation</h1>
 
 <div class="glasses-frame" id="glassesFrame">

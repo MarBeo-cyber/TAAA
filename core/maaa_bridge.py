@@ -21,17 +21,30 @@ Integration points:
     Emergency: TAAA-E operates as sub-module of MAAA with direct channel access
     Daily:     TAAA-D runs independently, uses MAAA only for sensor stream
 
-The MAAA connection is optional — TAAA functions standalone
-but gains precision with MAAA's real-time human state estimates.
+STATUS: UNIMPLEMENTED PROTOCOL SKETCH.
+
+This module defines the message shapes and the constraint checks for a TAAA↔MAAA
+integration. There is no MAAA process in this repository, and nothing in the
+TAAA pipeline imports this module: TAAAAgent, the REST API and the AR display
+all run without it. Its only consumer is scenarios/negotiation_bilateral.py,
+which drives it in simulation_mode to illustrate the protocol.
+
+What is real here: TAAAInjection.validate() (the MAAA 9-word emergency
+constraint), the injection log, and the pre-calibrated signal / debrief
+builders. What is not real: any connection to a MAAA. `connect()` will attempt
+an HTTP call and fall back to simulation; `get_human_state()` in simulation mode
+returns values derived from the scenario_stress argument you pass it, not from
+any sensor.
+
+Do not cite this module as evidence that TAAA integrates with MAAA.
 """
 
 from __future__ import annotations
 
 import time
-import json
 import logging
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional
 
 logger = logging.getLogger("taaa.maaa_bridge")
 
@@ -112,10 +125,12 @@ class TAAAInjection:
 
 class MAABridge:
     """
-    TAAA-MAAA integration bridge.
+    TAAA-MAAA integration bridge — protocol sketch, not a live integration.
 
-    In production: connects via local API / shared memory with MAAA process.
-    In simulation: generates realistic MAAA state updates from scenario context.
+    In production: would connect via local API / shared memory with a MAAA
+    process. No such process exists in this repository.
+    In simulation (the default, and the only mode exercised): derives state
+    arithmetically from the scenario_stress argument. Nothing is measured.
     """
 
     def __init__(self, simulation_mode: bool = True,
@@ -182,7 +197,8 @@ class MAABridge:
             return self._simulate_state(0.2)
 
     def _simulate_state(self, stress: float) -> MAAAStateUpdate:
-        """Simulate MAAA human state from stress estimate."""
+        """Derive a MAAA-shaped state from the stress number the caller passed.
+        A formula over one argument, not a reading."""
         receptivity = max(0.1, 1.0 - stress * 0.7)
         if stress > 0.80:
             state = "panicking"

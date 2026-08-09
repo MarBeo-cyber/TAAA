@@ -7,9 +7,12 @@ Integrates ChatGPT's SARS score (adopted with credit) with:
   - MAAA bridge for stress_load (real-time biometrics)
   - Signal extractor for computing scores from raw signals
 
-Original SARS formula (ChatGPT, 2026):
-  SARS = ambiguity*0.25 + domain*0.25 + consequence*0.25
+SARS formula, as specified in Working Paper Addendum v0.5 §4:
+  SARS = ambiguity*0.25 + domain*0.30 + consequence*0.20
        + confidence_mismatch*0.15 + stress*0.10
+
+(The earlier prototype used 0.25/0.25/0.25/0.15/0.10. The code now matches the
+addendum rather than the prototype.)
 
 M2 is friction-triggered, not time-triggered.
 It activates when the system detects cognitive friction:
@@ -28,7 +31,6 @@ from enum import Enum
 from uuid import uuid4
 from typing import Optional
 
-from schema_memory.m1_priors import M1
 from core.bilateral_consent import CONSENT_MANAGER
 
 logger = logging.getLogger("taaa.friction_trigger")
@@ -51,8 +53,17 @@ class RiskClass(str, Enum):
 
 
 class TriggerState(str, Enum):
-    INACTIVE = "inactive"
-    ACTIVE   = "active"
+    """Three states, as specified in Addendum v0.5 §5.
+
+    MONITORING is the L2 band: the system has noticed friction but does not
+    escalate to a cognitive-layer bridge. It exists because the realistic
+    intercultural cases measured through TAAAAgent land between 0.35 and the
+    0.55 escalation threshold — previously they were reported as INACTIVE,
+    which is not what the pipeline was doing.
+    """
+    INACTIVE   = "inactive"
+    MONITORING = "monitoring"
+    ACTIVE     = "active"
 
 
 class ConfidenceLevel(str, Enum):
@@ -139,24 +150,35 @@ class FrictionTriggerEngine:
     SARS score implementation, adopted from ChatGPT M2 prototype.
     Extended with M1-aware domain_distance and consent gating.
 
-    Threshold tuning:
-      0.62 = balanced (adopted from ChatGPT)
-      0.50 = sensitive (catches more, more false positives)
-      0.75 = conservative (fewer interventions, higher precision)
+    Threshold tuning. These numbers are inside the range the pipeline can
+    actually produce; the previous docstring advertised 0.62 / 0.75 against a
+    measured ceiling of 0.52. Measured by tests/test_reachability.py, which
+    sweeps SignalExtractor output through TAAAAgent and fails if the reachable
+    maximum drops below the conservative threshold:
+
+      0.45 = sensitive    (catches the mid-band intercultural cases)
+      0.55 = default      (Addendum v0.5 §4 escalation threshold)
+      0.65 = conservative (fewer escalations, higher precision)
+
+    Reachable SARS range through TAAAAgent, measured over the sweep in
+    tests/test_reachability.py: 0.000 – 0.722.
     """
 
-    DEFAULT_THRESHOLD = 0.50
+    DEFAULT_THRESHOLD   = 0.55   # Addendum v0.5 §4
+    MONITORING_THRESHOLD = 0.35  # L2 observation band floor
 
     WEIGHTS = {
         "ambiguity":           0.25,
-        "domain":              0.25,
-        "consequence":         0.25,
+        "domain":              0.30,
+        "consequence":         0.20,
         "confidence_mismatch": 0.15,
         "stress":              0.10,
     }
 
-    def __init__(self, threshold: float = DEFAULT_THRESHOLD):
+    def __init__(self, threshold: float = DEFAULT_THRESHOLD,
+                 monitoring_threshold: float = MONITORING_THRESHOLD):
         self.threshold = threshold
+        self.monitoring_threshold = min(monitoring_threshold, threshold)
 
     def score(self, event: CognitiveEvent) -> TriggerResult:
         event = event.clamp()
@@ -187,10 +209,16 @@ class FrictionTriggerEngine:
                 consent_checked = True
 
         active = sars >= self.threshold
+        if active:
+            state = TriggerState.ACTIVE
+        elif sars >= self.monitoring_threshold:
+            state = TriggerState.MONITORING
+        else:
+            state = TriggerState.INACTIVE
 
         return TriggerResult(
             score=round(sars, 4),
-            state=TriggerState.ACTIVE if active else TriggerState.INACTIVE,
+            state=state,
             reasons=reasons,
             m2_recommended=active,
             consent_checked=consent_checked,
@@ -205,6 +233,14 @@ class SchemaRiskClassifier:
     Classifies the type of schema risk.
     Preserves the ignorance/interference distinction central to TAAA.
     """
+
+    # SignalExtractor's user_confidence floor, with the behavioural signals the
+    # agent actually supplies (speech_hesitation=0, gaze_dwell_ms=0), is
+    #     0.10*0.65 + 1.0*0.20 + 1.0*0.15 = 0.415
+    # The old cut-off of 0.35 was therefore below the floor and IGNORANCE — half
+    # of the framework's headline distinction — could not be produced at all.
+    # 0.45 sits just above the floor, so the band is narrow but real.
+    IGNORANCE_CONFIDENCE_MAX = 0.45
 
     def classify(self, event: CognitiveEvent) -> RiskClass:
         event = event.clamp()
@@ -224,7 +260,7 @@ class SchemaRiskClassifier:
             return RiskClass.UNRESOLVED_AMBIGUITY
 
         # Ignorance: low user confidence (knows they don't know)
-        if event.user_confidence <= 0.35:
+        if event.user_confidence <= self.IGNORANCE_CONFIDENCE_MAX:
             return RiskClass.IGNORANCE
 
         return RiskClass.NONE
@@ -249,11 +285,32 @@ class SafetyGovernor:
         return domain.lower().strip() in self.HIGH_RISK_DOMAINS
 
     def operational_update_allowed(self, event: CognitiveEvent) -> bool:
+        """May this event update *operational* M2 topology? Never in OPERATIONAL
+        mode — that is the architectural invariant from PATCH_NOTES_M2_GATED."""
         if event.mode == LearningMode.OPERATIONAL:
             return False
         if self.is_high_risk(event.domain):
             return False
         return event.mode in {LearningMode.SANDBOX, LearningMode.VALIDATION}
+
+    def sandbox_capture_allowed(self, event: CognitiveEvent) -> bool:
+        """May we record a C0 sandbox hypothesis for later human review?
+
+        This is a strictly weaker permission than operational_update_allowed.
+        A sandbox hypothesis is not memory: it enters GatedM2Memory at C0 and
+        publish_operational() raises PermissionError below C3. Recording one
+        from an operational observation is therefore safe, and is what makes the
+        proposal queue have anything in it — previously this branch was gated on
+        operational_update_allowed, which is always False in OPERATIONAL mode,
+        so GatedM2Memory.create_sandbox was unreachable from TAAAAgent.
+
+        The one exception: in a high-risk domain even an unreviewed record of a
+        consequential event is withheld unless the session is explicitly a
+        sandbox/validation session.
+        """
+        if self.is_high_risk(event.domain):
+            return event.mode in {LearningMode.SANDBOX, LearningMode.VALIDATION}
+        return True
 
     def recommendation(self, event: CognitiveEvent, risk: RiskClass) -> str:
         if self.is_high_risk(event.domain):
@@ -356,6 +413,8 @@ class M2Orchestrator:
 
         if tr.state == TriggerState.ACTIVE:
             notes.append(f"M2 trigger active: SARS={tr.score:.3f} — {', '.join(tr.reasons)}")
+        elif tr.state == TriggerState.MONITORING:
+            notes.append(f"M2 observation band (no escalation): SARS={tr.score:.3f}")
         if risk != RiskClass.NONE:
             notes.append(f"Risk class: {risk.value}")
         if not allowed:
@@ -363,8 +422,9 @@ class M2Orchestrator:
         if tr.consent_checked:
             notes.append(f"Consent level: {tr.consent_level}")
 
-        # Create sandbox hypothesis if allowed and friction detected
-        if allowed and risk != RiskClass.NONE:
+        # Create a C0 sandbox hypothesis if capture is permitted and friction
+        # was detected. C0 can never be published operationally (needs C3/C4).
+        if self.safety.sandbox_capture_allowed(event) and risk != RiskClass.NONE:
             mismatch = max(0.0, event.user_confidence - event.system_confidence)
             proposed = self.memory.create_sandbox(
                 label=f"{event.domain}_{risk.value}",
@@ -374,6 +434,7 @@ class M2Orchestrator:
                     f"{event.text[:120]}"
                 ),
                 evidence=[
+                    f"sars={tr.score:.3f}",
                     f"ambiguity={event.ambiguity_score:.2f}",
                     f"domain_distance={event.domain_distance:.2f}",
                     f"consequence={event.consequence_score:.2f}",

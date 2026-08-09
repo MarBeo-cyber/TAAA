@@ -19,7 +19,6 @@ PAAA provides real-time biometric position estimation.
 
 from __future__ import annotations
 
-import math
 import time
 import logging
 from dataclasses import dataclass

@@ -259,24 +259,47 @@ class M1Registry:
         cid = self._profession_map.get(profession.lower())
         return self._profiles.get(cid) if cid else None
 
+    # Dimensions copied into the prior, and the source weights.
+    PRIOR_DIMENSIONS = [
+        "time_structure", "reasoning_style", "context_level", "silence_meaning",
+        "directness", "deadline_ontology", "question_as_answer",
+        "spatial_orientation", "knowledge_validation",
+    ]
+    SOURCE_WEIGHTS = {"culture": 0.5, "profession": 0.4}
+
     def build_prior(self, culture: Optional[str] = None,
                     profession: Optional[str] = None,
                     age: Optional[int] = None,
                     context: Optional[str] = None) -> dict:
         """
-        Build a composite M1 prior from available dimensions.
-        Returns weighted blend if multiple profiles available.
+        Build a composite M1 prior from the available dimensions.
+
+        These are categorical dimensions ("high_context" vs "low_context"), not
+        numbers: there is no meaningful arithmetic mean of two of them. So the
+        blend is per-dimension and explicit:
+
+          - both sources agree  → the agreed value, source "culture+profession"
+          - they disagree       → the higher-weighted source wins (culture 0.5
+                                  beats profession 0.4) AND the loser's value is
+                                  recorded in `contested_dimensions`
+          - only one source     → that source
+
+        The previous version sorted by weight, took the single winner for every
+        dimension, and still advertised `profiles_used: ["culture","profession"]`.
+        The profession profile never contributed anything. `dimension_sources`
+        below now says, per dimension, which profile the value came from.
+
         This is the Bayesian prior — immediately updated by M2 evidence.
         """
-        profiles = []
+        sources: dict[str, CulturalSchemaProfile] = {}
         if culture and culture in self._profiles:
-            profiles.append(("culture", self._profiles[culture], 0.5))
+            sources["culture"] = self._profiles[culture]
         if profession:
             prof_profile = self.get_by_profession(profession)
             if prof_profile:
-                profiles.append(("profession", prof_profile, 0.4))
+                sources["profession"] = prof_profile
 
-        if not profiles:
+        if not sources:
             # No prior available — fall back to M0 only
             return {
                 "m_level": "M0",
@@ -284,24 +307,45 @@ class M1Registry:
                 "note": "No M1 prior for this profile. Operating on M0 only.",
             }
 
-        # Dominant profile
-        _, dominant, _ = sorted(profiles, key=lambda x: x[2], reverse=True)[0]
-        prior = {
+        ranked = sorted(sources.items(),
+                        key=lambda kv: self.SOURCE_WEIGHTS[kv[0]], reverse=True)
+
+        prior: dict = {
             "m_level": "M1",
             "prior_available": True,
-            "profiles_used": [p[0] for p in profiles],
-            "time_structure": dominant.time_structure,
-            "reasoning_style": dominant.reasoning_style,
-            "context_level": dominant.context_level,
-            "silence_meaning": dominant.silence_meaning,
-            "directness": dominant.directness,
-            "deadline_ontology": dominant.deadline_ontology,
-            "question_as_answer": dominant.question_as_answer,
-            "high_interference_contexts": dominant.high_interference_contexts,
-            "spatial_orientation": dominant.spatial_orientation,
-            "knowledge_validation": dominant.knowledge_validation,
-            "note": "Bayesian prior — update immediately with individual evidence.",
+            "profiles_used": [name for name, _ in ranked],
+            "source_communities": {n: p.community_id for n, p in ranked},
+            "source_weights": {n: self.SOURCE_WEIGHTS[n] for n, _ in ranked},
         }
+        dimension_sources: dict[str, str] = {}
+        contested: dict[str, dict] = {}
+
+        for dim in self.PRIOR_DIMENSIONS:
+            values = {name: getattr(p, dim) for name, p in ranked}
+            winner_name, winner_profile = ranked[0]
+            prior[dim] = getattr(winner_profile, dim)
+            distinct = {v for v in values.values()}
+            if len(distinct) == 1:
+                dimension_sources[dim] = "+".join(values)
+            else:
+                dimension_sources[dim] = winner_name
+                contested[dim] = values
+
+        # Union: a context is high-interference if ANY source says so. Dropping
+        # the profession's contexts here is how a doctor's clinical interference
+        # contexts used to vanish behind their cultural profile.
+        merged_contexts: list[str] = []
+        for _, p in ranked:
+            for ctx in p.high_interference_contexts:
+                if ctx not in merged_contexts:
+                    merged_contexts.append(ctx)
+
+        prior["high_interference_contexts"] = merged_contexts
+        prior["dimension_sources"] = dimension_sources
+        prior["contested_dimensions"] = contested
+        prior["note"] = ("Bayesian prior — update immediately with individual "
+                         "evidence. Categorical dimensions are resolved by "
+                         "source weight, not averaged; see contested_dimensions.")
         return prior
 
     def interference_risk(self, subject_profile_id: str,

@@ -117,6 +117,16 @@ class InterventionEngine:
     Selects and generates interventions based on gap analysis and M-level.
     """
 
+    @property
+    def llm_available(self) -> bool:
+        """True when the anthropic client was constructed at import time.
+
+        This is *not* a promise that calls will succeed: a client with no API
+        key constructs fine and fails at request time. Every call site falls
+        back to the rule-based path on any exception.
+        """
+        return _LLM_AVAILABLE
+
     def generate(self,
                  gap: GapAnalysis,
                  timing: TimingDecision,
@@ -215,7 +225,7 @@ class InterventionEngine:
             rationale=(
                 f"Interference '{interference.schema_name}' "
                 f"(strength={interference.strength:.2f}). "
-                f"Haptic interrupt → AR redirect. No negation."
+                "Haptic interrupt → AR redirect. No negation."
             )
         )
 
@@ -311,13 +321,17 @@ Generate a cultural bridge intervention. Remember: max 9 words for voice."""
         if _LLM_AVAILABLE and subject_profile:
             return self._deep_translation_llm(gap, scenario, subject_profile,
                                               environment_profile)
+        return self._deep_translation_rules()
+
+    def _deep_translation_rules(self) -> Intervention:
+        """Rule-based M2 output. Terminal: never re-enters the LLM path."""
         return Intervention(
             strategy=InterventionStrategy.DEEP_TRANSLATION,
             m_level="M2",
             ar_active=False,
             voice_active=True,
             voice_message="Schema diverso rilevato. Adattamento in corso.",
-            rationale="M2 deep translation (fallback)."
+            rationale="M2 deep translation (rule-based fallback)."
         )
 
     def _deep_translation_llm(self, gap: GapAnalysis, scenario: str,
@@ -350,5 +364,7 @@ Voice: max 9 words."""
             )
         except Exception as e:
             logger.warning("[InterventionEngine] LLM failed: %s", e)
-            return self._deep_translation(None, scenario, subject_profile,
-                                          environment_profile, None)
+            # Return the rule-based intervention directly. Re-entering
+            # _deep_translation() here used to loop straight back into this
+            # method with gap=None and crash on gap.gap_type outside the try.
+            return self._deep_translation_rules()

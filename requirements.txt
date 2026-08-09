@@ -1,5 +1,12 @@
 flask>=2.3.0
 anthropic>=0.25.0
+# anthropic is required, but no API key is. Every LLM call site is wrapped in
+# try/except with a rule-based fallback; the test suite and `python main_taaa.py
+# demo` both run to completion with no key set.
+
+# Development / CI extras live in pyproject.toml:  pip install -e ".[dev]"
+#   pytest, pyflakes
+
 # Optional for production extensions:
 # networkx>=3.2          # Schema memory graph operations
 # numpy>=1.24.0          # Regression curve computation

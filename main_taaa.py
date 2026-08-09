@@ -10,9 +10,12 @@ Endpoints:
   GET  /subject/<id>          → subject profile + M2 topology size
   POST /process               → run one pipeline cycle
   GET  /m1/interference_risk  → M1 interference risk between two profiles
-  POST /cav/validate          → Cultural Adversarial Validator
+  POST /cav/run               → Cultural Adversarial cycle (see caveat in body)
   POST /demo/<scenario>       → run a demo scenario
   GET  /stats                 → session statistics
+  GET  /ar                    → live AR HUD  (api/ar_display.py)
+  GET  /ar/stream             → SSE stream of real pipeline cycles
+  POST /ar/scenario/<name>    → run a scenario and stream it to /ar
 """
 
 import sys
@@ -30,7 +33,9 @@ logging.basicConfig(
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 from flask import Flask, jsonify, request
+from api.ar_display import register_ar_routes
 from core.taaa_agent import TAAAAgent
+from components.friction_trigger import FrictionTriggerEngine
 from schema_memory.m0_archetypes import M0
 from schema_memory.m1_priors import M1
 from components.timing_controller import RegressionCurveProfile
@@ -41,17 +46,30 @@ def create_app(agent: TAAAAgent) -> Flask:
     app = Flask(__name__)
     cav = CulturalAdversarialValidator()
 
+    # Live AR HUD + SSE stream. This also sets agent.event_sink, so every
+    # pipeline cycle reaches /ar/stream. Previously register_ar_routes existed
+    # but was never called, so GET /ar returned 404.
+    register_ar_routes(app, agent)
+
     @app.get("/status")
     def status():
+        # `_LLM_AVAILABLE` is a module global in intervention_engine, never an
+        # instance attribute, so the old hasattr() probe was always False and
+        # this field permanently read "unknown". `llm_available` is a property.
         return jsonify({
-            "agent": "TAAA v0.4",
+            "agent": "TAAA v0.4 (+ v0.5 SARS weights/threshold)",
             "m0_schemas": len(M0.all_schemas()),
             "m0_emergency_subset": len(M0.emergency_subset()),
             "subjects_registered": len(agent._subjects),
             "total_cycles": agent.stats().get("total_cycles", 0),
-            "llm_available": agent.intervention_engine._LLM_AVAILABLE
-                             if hasattr(agent.intervention_engine, '_LLM_AVAILABLE')
-                             else "unknown",
+            "llm_available": agent.intervention_engine.llm_available,
+            "llm_note": ("llm_available means the anthropic client was "
+                         "constructed, not that calls succeed. Without a valid "
+                         "API key every LLM path falls back to its rule-based "
+                         "branch."),
+            "sars_weights": FrictionTriggerEngine.WEIGHTS,
+            "sars_threshold": FrictionTriggerEngine.DEFAULT_THRESHOLD,
+            "sars_monitoring_threshold": FrictionTriggerEngine.MONITORING_THRESHOLD,
         })
 
     @app.get("/m0/schemas")
@@ -130,45 +148,9 @@ def create_app(agent: TAAAAgent) -> Flask:
             paaa_hrv=body.get("paaa_hrv"),
             paaa_gsr=body.get("paaa_gsr"),
         )
-        return jsonify({
-            "tick":            result.tick,
-            "latency_ms":      result.latency_ms,
-            "domain":          result.domain,
-            "gap": {
-                "type":                result.gap.gap_type.value,
-                "confidence":          result.gap.confidence,
-                "active_schema":       result.gap.active_schema,
-                "suppression_required": result.gap.suppression_required,
-                "rationale":           result.gap.rationale,
-            },
-            "interference": {
-                "schema":      result.interference.schema_name,
-                "strength":    result.interference.strength,
-                "timing_ms":   result.interference.timing_window_ms,
-                "strategy":    result.interference.suppression_strategy,
-            } if result.interference else None,
-            "timing": {
-                "m_level":          result.timing.current_m_level.value,
-                "stress":           result.timing.stress_estimate,
-                "output_type":      result.timing.output_type.value,
-                "delay_ms":         result.timing.delay_before_output_ms,
-                "paaa_used":        result.timing.paaa_biometrics_used,
-            },
-            "intervention": {
-                "strategy":         result.intervention.strategy.value,
-                "m_level":          result.intervention.m_level,
-                "ar_active":        result.intervention.ar_active,
-                "ar_instruction":   result.intervention.ar_instruction,
-                "ar_schema":        result.intervention.ar_schema,
-                "haptic_active":    result.intervention.haptic_active,
-                "haptic_pattern":   result.intervention.haptic_pattern,
-                "voice_active":     result.intervention.voice_active,
-                "voice_message":    result.intervention.voice_message,
-                "suppression_first": result.intervention.suppression_first,
-                "rationale":        result.intervention.rationale,
-            },
-            "m2_learning_event": result.m2_learning_event,
-        })
+        # Same serialiser the AR stream uses, so the HUD and the API can never
+        # disagree about what a cycle produced.
+        return jsonify(TAAAAgent.result_to_dict(result))
 
     @app.get("/m1/interference_risk")
     def interference_risk():
@@ -176,10 +158,10 @@ def create_app(agent: TAAAAgent) -> Flask:
         environment = request.args.get("environment", "east_asian")
         return jsonify(M1.interference_risk(subject, environment))
 
-    @app.post("/cav/validate")
-    def cav_validate():
+    @app.post("/cav/run")
+    def cav_run():
         body = request.json or {}
-        result = cav.validate(
+        report = cav.run_cycle(
             scenario=body.get("scenario", ""),
             source_schema=body.get("source_schema", ""),
             target_schema=body.get("target_schema", ""),
@@ -187,25 +169,30 @@ def create_app(agent: TAAAAgent) -> Flask:
             max_cycles=int(body.get("max_cycles", 2)),
         )
         return jsonify({
-            "validated_translation":  result.validated_translation,
-            "composite_score":        result.composite_score,
-            "western_score":          result.western_score,
-            "eastern_score":          result.eastern_score,
-            "diversity_preserved":    result.diversity_preserved,
-            "proposals_evaluated":    result.proposals_evaluated,
-            "convergence_note":       result.convergence_note,
-            "rosetta_stone_analogy":  result.rosetta_stone_analogy,
+            "translation":             report.translation,
+            "adversarially_validated": report.adversarially_validated,
+            "score_basis":             report.score_basis,
+            "heuristic_score":         report.heuristic_score,
+            "western_heuristic":       report.western_heuristic,
+            "eastern_heuristic":       report.eastern_heuristic,
+            "diversity_heuristic":     report.diversity_heuristic,
+            "proposals_evaluated":     report.proposals_evaluated,
+            "convergence_note":        report.convergence_note,
+            "rosetta_stone_analogy":   report.rosetta_stone_analogy,
+            "caveat":                  report.caveat,
         })
 
     @app.post("/demo/<scenario_name>")
     def demo(scenario_name):
         from scenarios.demo import (
-            scenario_shinjuku, scenario_negotiation, scenario_medical
+            scenario_shinjuku, scenario_negotiation, scenario_medical,
+            scenario_contract_m2,
         )
         demos = {
             "shinjuku":    scenario_shinjuku,
             "negotiation": scenario_negotiation,
             "medical":     scenario_medical,
+            "contract":    scenario_contract_m2,
         }
         if scenario_name not in demos:
             return jsonify({"error": f"unknown demo '{scenario_name}'",
@@ -222,36 +209,39 @@ def create_app(agent: TAAAAgent) -> Flask:
 
 
 def main():
-    import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "demo"
     agent = TAAAAgent(simulation_mode=True, verbose=True)
 
     if mode == "demo":
         from scenarios.demo import run_all
-        run_all()
+        # Pass the agent we just built. run_all() used to construct its own and
+        # this one was discarded, which is why "Agent initialized" logged twice.
+        run_all(agent)
 
     elif mode == "server":
-        def _bg():
-            pass  # No background loop needed — TAAA is event-driven
         app = create_app(agent)
-        print(f"\n  TAAA REST API → http://localhost:5004")
+        print("\n  TAAA REST API → http://localhost:5004")
         print("  Endpoints:")
+        print("    GET  /status            → agent + SARS configuration")
+        print("    GET  /ar                → live AR HUD, driven by /ar/stream")
         print("    GET  /m0/visual_cliff   → paradigm case (biological grounding)")
         print("    GET  /m0/shinjuku       → emergency intervention demo")
         print("    POST /subject/register  → register subject")
         print("    POST /process           → run pipeline cycle")
-        print("    POST /cav/validate      → Cultural Adversarial Validator")
+        print("    POST /cav/run           → Cultural Adversarial cycle")
         print("    POST /demo/shinjuku     → Shinjuku scenario")
         print("    POST /demo/negotiation  → David/Tanaka negotiation")
         print("    POST /demo/medical      → Lin Mei medical consultation\n")
         app.run(host="0.0.0.0", port=5004, threaded=True)
 
     elif mode == "both":
+        # Server plus a one-shot demo run, so /ar has live events to render.
         def _demo():
-            import time; time.sleep(1)
-            from scenarios.demo import run_all; run_all()
-        t = threading.Thread(target=_demo, daemon=True)
-        t.start()
+            import time
+            time.sleep(1)
+            from scenarios.demo import run_all
+            run_all(agent)
+        threading.Thread(target=_demo, daemon=True).start()
         app = create_app(agent)
         app.run(host="0.0.0.0", port=5004, threaded=True)
 
