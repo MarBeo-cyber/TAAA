@@ -24,6 +24,16 @@ import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# La console di Windows usa cp1252: i simboli Unicode di questo CLI la fanno
+# morire con UnicodeEncodeError a meta' esecuzione. Forziamo UTF-8 sullo stdout
+# dove il runtime lo permette, con sostituzione al posto dell'errore.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 import logging
 logging.basicConfig(
     level=logging.INFO,
